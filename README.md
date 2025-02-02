@@ -7,16 +7,17 @@
 
 ## 🌟 Key Features
 
-| Feature Category          | Superpowers 🦸♂️                                                                 |
-|---------------------------|---------------------------------------------------------------------------------|
-| **Zero-Gas Trading**       | EIP-712 signed orders • ERC-2612 permit integration • Batched reward claims    |
-| **MEV Fairness**           | Reward based on excess value • Transparent tracking • Insurance fund (0.05%)  |
-| **Institutional Security** | Multi-sig controls • Parameter timelocks • Circuit breakers • TWAP validation  |
-| **Liquidity Protection**   | Price manipulation defenses • Toxic MEV filtering • Enhanced pool analytics    |
+| Feature Category | Superpowers 🦸♂️ |
+|-----------------|-----------------|
+| **Zero-Gas Trading** | EIP-712 signed orders • ERC-2612 permit integration • Batched reward claims |
+| **MEV Fairness** | Reward based on excess value • Transparent tracking • Insurance fund (0.05%) |
+| **Institutional Security** | Multi-sig controls • Parameter timelocks • Circuit breakers • TWAP validation |
+| **Liquidity Protection** | Price manipulation defenses • Toxic MEV filtering • Enhanced pool analytics |
 
 ## 🛠 How It Works
 
 ### Technical Architecture
+
 ```mermaid
 graph TD
     A[Trader Signs Order] --> B{EIP-712 Signature}
@@ -28,35 +29,30 @@ graph TD
     G --> H([Trader: 80% Value])
     G --> I([Searcher: 18% Value])
     G --> J([Insurance: 2% Value])
+```
 
-Core Components
-Gasless Hook Contract
+### Core Components
 
-Handles order validation & MEV distribution
+#### Gasless Hook Contract
+- Handles order validation & MEV distribution
+- Implements Uniswap V4 hook callbacks
+- Manages reward tracking across multiple tokens
 
-Implements Uniswap V4 hook callbacks
+#### Signature Engine 🔏
+- Separate EIP-712 (orders) and ERC-2612 (permits)
+- Nonce-based replay protection
+- Cross-chain signature validation
 
-Manages reward tracking across multiple tokens
+#### MEV Oracle 🔮
+- Real-time profit calculation
+- Dynamic reward percentages
+- Black swan event detection
 
-Signature Engine 🔏
+## 👩💻 User Journeys
 
-Separate EIP-712 (orders) and ERC-2612 (permits)
+### Trader Experience (Alice's Story)
 
-Nonce-based replay protection
-
-Cross-chain signature validation
-
-MEV Oracle 🔮
-
-Real-time profit calculation
-
-Dynamic reward percentages
-
-Black swan event detection
-
-👩💻 User Journeys
-Trader Experience (Alice's Story)
-
+```javascript
 // Sample Order Object
 {
   tokenIn: ETH,
@@ -66,33 +62,40 @@ Trader Experience (Alice's Story)
   deadline: 20 mins,
   rewardEstimate: 0.02 ETH
 }
+```
 
-Secure Signing ✍️
+#### Secure Signing ✍️
+- Signs with wallet (0 gas)
+- Gets order hash: 0x123...abc
 
-Signs with wallet (0 gas)
+#### Order Lifecycle ⏳
 
-Gets order hash: 0x123...abc
+| Status | Duration | Action Required |
+|--------|----------|----------------|
+| Pending | 0-2 mins | Waiting for searcher |
+| Executed | - | Funds auto-received |
+| Expired | >20 mins | Requires re-sign |
 
-Order Lifecycle ⏳
-
-Status	Duration	Action Required
-Pending	0-2 mins	Waiting for searcher
-Executed	-	Funds auto-received
-Expired	>20 mins	Requires re-sign
-
+```javascript
 // Reward calculation
 actualOut = 2550 USDC
 minOut = 2500 USDC
 reward = (50 USDC * 200 bps) = 1 USDC
+```
 
-Liquidity Provider Experience (Bob's Strategy)
-Metric	Hook Pool 🪝	Regular Pool 🌀	Advantage 📈
-Daily Volume	$5.2M	$3.8M	+36.8%
-MEV Protection	Level 3	Level 1	-62% loss
-Fee Efficiency	22%	18%	+4%
+### Liquidity Provider Experience (Bob's Strategy)
 
-🛡 Security First
-Multi-Layer Protection
+| Metric | Hook Pool 🪝 | Regular Pool 🌀 | Advantage 📈 |
+|--------|-------------|-----------------|--------------|
+| Daily Volume | $5.2M | $3.8M | +36.8% |
+| MEV Protection | Level 3 | Level 1 | -62% loss |
+| Fee Efficiency | 22% | 18% | +4% |
+
+## 🛡 Security First
+
+### Multi-Layer Protection
+
+```solidity
 // Critical Security Snippets
 
 // Reentrancy protection
@@ -113,25 +116,25 @@ function validatePrice() internal {
 function emergencyPause() external onlyGuardian {
     systemPaused = true;
 }
+```
 
-🚀 Getting Started
-Requirements
-Foundry 0.8.20+
+## 🚀 Getting Started
 
-Node.js 18.x
+### Requirements
+- Foundry 0.8.20+
+- Node.js 18.x
+- Uniswap V4 Environment
 
-Uniswap V4 Environment
-
-Installation
-bash
-Copy
+### Installation
+```bash
 git clone https://github.com/yourrepo/dex-mini-gasless-hook
 cd dex-mini-gasless-hook
 forge install
 forge build
-Test Flow
-bash
-Copy
+```
+
+### Test Flow
+```bash
 # Run security tests
 forge test --match-test testSecurity
 
@@ -140,10 +143,9 @@ forge test --match-test testMEV
 
 # Check gas metrics
 forge test --gas-report
+```
 
 Transform your DEX experience - Where traders, LPs and searchers win together. 🚀
-
-Copy
 
 This README features:
 1. Visual hierarchy with emojis and sections
