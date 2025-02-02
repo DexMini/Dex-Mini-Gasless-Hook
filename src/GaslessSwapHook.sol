@@ -1,6 +1,36 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+/**
+ * @title GaslessSwapHook
+ * @notice A Uniswap V4 Hook enabling gasless swaps with MEV profit sharing
+ * @dev This contract implements:
+ * - EIP-712 for order signing
+ * - ERC-2612 for gasless token approvals
+ * - MEV reward distribution system
+ * - Insurance mechanism for trade protection
+ *
+ * Architecture Overview:
+ * 1. Trader signs an order (off-chain)
+ * 2. MEV searcher executes the order through this hook
+ * 3. Hook validates signatures and executes swap
+ * 4. Profits are distributed between trader, searcher, and insurance fund
+ */
+
+/*////////////////////////////////////////////////////////////////////////////
+//                                                                          //
+//     ██████╗ ███████╗██╗  ██╗    ███╗   ███╗██╗███╗   ██╗██╗           //
+//     ██╔══██╗██╔════╝╚██╗██╔╝    ████╗ ████║██║████╗  ██║██║           //
+//     ██║  ██║█████╗   ╚███╔╝     ██╔████╔██║██║██╔██╗ ██║██║           //
+//     ██║  ██║██╔══╝   ██╔██╗     ██║╚██╔╝██║██║██║╚██╗██║██║           //
+//     ██████╔╝███████╗██╔╝ ██╗    ██║ ╚═╝ ██║██║██║ ╚████║██║           //
+//     ╚═════╝ ╚══════╝╚═╝  ╚═╝    ╚═╝     ╚═╝╚═╝╚═╝  ╚═══╝╚═╝           //
+//                                                                          //
+//     Uniswap V4 Hook - Version 1.0                                       //
+//     https://dexmini.com                                                 //
+//                                                                          //
+////////////////////////////////////////////////////////////////////////////*/
+
 // Uniswap imports with correct paths
 import {BaseHook} from "@uniswap/v4-periphery/src/base/hooks/BaseHook.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
@@ -25,7 +55,15 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
     using CurrencyLibrary for Currency;
     using ECDSA for bytes32;
 
-    // Events
+    /**
+     * @notice Emitted when a gasless swap is successfully executed
+     * @param trader The address of the trader who initiated the swap
+     * @param tokenIn The token being sold
+     * @param tokenOut The token being bought
+     * @param amountIn The amount of tokenIn sold
+     * @param amountOut The amount of tokenOut received
+     * @param reward The MEV reward amount given to the trader
+     */
     event GaslessSwapExecuted(
         address indexed trader,
         address tokenIn,
@@ -35,21 +73,51 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
         uint256 reward
     );
 
+    /**
+     * @notice Emitted when a trader claims their accumulated rewards
+     * @param trader The address claiming rewards
+     * @param token The token being claimed
+     * @param amount The amount claimed
+     */
     event RewardsClaimed(
         address indexed trader,
         address indexed token,
         uint256 amount
     );
 
+    /**
+     * @notice EIP-712 typehash for orders
+     * @dev Includes both order parameters and pool key parameters for atomic validation
+     */
     bytes32 public constant ORDER_TYPEHASH =
         keccak256(
-            "Order(address trader,PoolKey poolKey,address tokenIn,address tokenOut,uint256 amount,uint256 minAmountOut,uint256 deadline,uint256 nonce,bool exactInput)PoolKey(Currency currency0,Currency currency1,uint24 fee,int24 tickSpacing,IHooks hooks,int24 minTick,int24 maxTick)"
-        );
-    bytes32 public constant POOLKEY_TYPEHASH =
-        keccak256(
-            "PoolKey(Currency currency0,Currency currency1,uint24 fee,int24 tickSpacing,IHooks hooks,int24 minTick,int24 maxTick)"
+            "Order(address trader,PoolKey poolKey,address tokenIn,address tokenOut,uint256 amount,uint256 minAmountOut,uint256 deadline,uint256 nonce,bool exactInput)PoolKey(Currency currency0,Currency currency1,uint24 fee,int24 tickSpacing,IHooks hooks)"
         );
 
+    /**
+     * @notice EIP-712 typehash for pool keys
+     * @dev Used as part of order signing to ensure pool parameters match
+     */
+    bytes32 public constant POOLKEY_TYPEHASH =
+        keccak256(
+            "PoolKey(Currency currency0,Currency currency1,uint24 fee,int24 tickSpacing,IHooks hooks)"
+        );
+
+    /**
+     * @notice Struct containing all order parameters
+     * @dev Used for both order signing and execution
+     * @param trader Address of the trader placing the order
+     * @param poolKey Uniswap V4 pool parameters
+     * @param tokenIn Token being sold
+     * @param tokenOut Token being bought
+     * @param amount Amount of tokenIn to sell
+     * @param minAmountOut Minimum amount of tokenOut to receive
+     * @param deadline Timestamp after which the order expires
+     * @param nonce Unique order nonce for replay protection
+     * @param exactInput Whether this is an exact input swap
+     * @param orderSignature EIP-712 signature for the order
+     * @param permitSignature ERC-2612 permit signature for tokenIn
+     */
     struct Order {
         address trader;
         PoolKey poolKey;
@@ -64,17 +132,36 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
         bytes permitSignature;
     }
 
-    uint256 public mevRewardBps = 200;
-    uint256 public constant MAX_MEV_REWARD_BPS = 1000;
-    uint256 public constant INSURANCE_FEE_BPS = 5;
+    // --- State Variables ---
 
+    /// @notice Percentage of excess value given as reward (in basis points)
+    uint256 public mevRewardBps = 200; // 2%
+
+    /// @notice Maximum allowed reward percentage
+    uint256 public constant MAX_MEV_REWARD_BPS = 1000; // 10%
+
+    /// @notice Insurance fee taken from all swaps
+    uint256 public constant INSURANCE_FEE_BPS = 5; // 0.05%
+
+    /// @notice Mapping of used nonces for replay protection
     mapping(address => uint256) public orderNonces;
-    mapping(address => mapping(address => uint256)) public pendingRewards; // token => trader => amount
+
+    /// @notice Mapping of unclaimed rewards per token per trader
+    mapping(address => mapping(address => uint256)) public pendingRewards;
+
+    /// @notice Addresses authorized to pause the system
     mapping(address => bool) public guardians;
+
+    /// @notice Accumulated insurance fees
     uint256 public insuranceReserve;
 
+    /// @notice System pause state for emergency stops
     bool public systemPaused;
+
+    /// @notice Delay required for parameter changes
     uint256 private constant TIMELOCK_DELAY = 2 days;
+
+    /// @notice Mapping of pending parameter changes with their activation timestamps
     mapping(bytes32 => uint256) public parameterChanges;
 
     modifier whenNotPaused() {
