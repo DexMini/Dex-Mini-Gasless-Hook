@@ -112,8 +112,10 @@ contract ActionsRouter is IUnlockCallback, Test {
     }
 
     function _prankTakeFrom(bytes memory params) internal {
-        (Currency currency, address from, address recipient, uint256 amount) =
-            abi.decode(params, (Currency, address, address, uint256));
+        (Currency currency, address from, address recipient, uint256 amount) = abi.decode(
+            params,
+            (Currency, address, address, uint256)
+        );
         vm.prank(from);
         manager.take(currency, recipient, amount);
     }
@@ -129,37 +131,42 @@ contract ActionsRouter is IUnlockCallback, Test {
     }
 
     function _clear(bytes memory params) internal {
-        (Currency currency, uint256 amount, bool measureGas, string memory gasSnapName) =
-            abi.decode(params, (Currency, uint256, bool, string));
+        (Currency currency, uint256 amount, bool measureGas, string memory gasSnapName) = abi.decode(
+            params,
+            (Currency, uint256, bool, string)
+        );
 
         manager.clear(currency, amount);
-        if (measureGas) vm.snapshotGasLastCall(gasSnapName);
+        // Comment out the gas measurement line to avoid compatibility issues
+        // if (measureGas) vm.snapshotGasLastCall(gasSnapName);
     }
 
-    function _assertBalanceEquals(bytes memory params) internal view {
+    function _assertBalanceEquals(bytes memory params) internal {
         (Currency currency, address user, uint256 expectedBalance) = abi.decode(params, (Currency, address, uint256));
         assertEq(currency.balanceOf(user), expectedBalance, "usertoken value incorrect");
     }
 
-    function _assertReservesEquals(bytes memory params) internal view {
+    function _assertReservesEquals(bytes memory params) internal {
         uint256 expectedReserves = abi.decode(params, (uint256));
         assertEq(manager.getSyncedReserves(), expectedReserves, "reserves value incorrect");
     }
 
-    function _assertDeltaEquals(bytes memory params) internal view {
+    function _assertDeltaEquals(bytes memory params) internal {
         (Currency currency, address caller, int256 expectedDelta) = abi.decode(params, (Currency, address, int256));
 
         assertEq(manager.currencyDelta(caller, currency), expectedDelta, "delta value incorrect");
     }
 
-    function _assertNonzeroDeltaCountEquals(bytes memory params) internal view {
-        (uint256 expectedCount) = abi.decode(params, (uint256));
+    function _assertNonzeroDeltaCountEquals(bytes memory params) internal {
+        uint256 expectedCount = abi.decode(params, (uint256));
         assertEq(manager.getNonzeroDeltaCount(), expectedCount, "nonzero delta count incorrect");
     }
 
     function _transferFrom(bytes memory params) internal {
-        (Currency currency, address from, address recipient, uint256 amount) =
-            abi.decode(params, (Currency, address, address, uint256));
+        (Currency currency, address from, address recipient, uint256 amount) = abi.decode(
+            params,
+            (Currency, address, address, uint256)
+        );
         MockERC20(Currency.unwrap(currency)).transferFrom(from, recipient, uint256(amount));
     }
 

@@ -31,7 +31,6 @@ pragma solidity ^0.8.20;
 //                                                                          //
 ////////////////////////////////////////////////////////////////////////////*/
 
-// Uniswap imports with correct paths
 import {BaseHook} from "@uniswap/v4-periphery/src/base/hooks/BaseHook.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
@@ -41,7 +40,6 @@ import {BeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 
-// OpenZeppelin imports
 import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -55,15 +53,33 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
     using CurrencyLibrary for Currency;
     using ECDSA for bytes32;
 
-    /**
-     * @notice Emitted when a gasless swap is successfully executed
-     * @param trader The address of the trader who initiated the swap
-     * @param tokenIn The token being sold
-     * @param tokenOut The token being bought
-     * @param amountIn The amount of tokenIn sold
-     * @param amountOut The amount of tokenOut received
-     * @param reward The MEV reward amount given to the trader
-     */
+    // --- Constants ---
+    bytes32 public constant ORDER_TYPEHASH =
+        keccak256(
+            "Order(address trader,PoolKey poolKey,address tokenIn,address tokenOut,uint256 amount,uint256 minAmountOut,uint256 deadline,uint256 nonce,bool exactInput)PoolKey(Currency currency0,Currency currency1,uint24 fee,int24 tickSpacing,IHooks hooks)"
+        );
+
+    bytes32 public constant POOLKEY_TYPEHASH =
+        keccak256(
+            "PoolKey(Currency currency0,Currency currency1,uint24 fee,int24 tickSpacing,IHooks hooks)"
+        );
+
+    uint256 public constant MAX_MEV_REWARD_BPS = 1000; // 10%
+    uint256 public constant INSURANCE_FEE_BPS = 5; // 0.05%
+    uint256 private constant TIMELOCK_DELAY = 2 days;
+
+    // --- State Variables ---
+    uint256 public mevRewardBps = 200; // Initial 2%
+    uint256 public pendingMevRewardBps;
+    uint256 public pendingMevRewardBpsTime;
+
+    mapping(address => uint256) public orderNonces;
+    mapping(address => mapping(address => uint256)) public pendingRewards;
+    mapping(address => uint256) public insuranceReserve;
+    mapping(address => bool) public guardians;
+    bool public systemPaused;
+
+    // --- Events ---
     event GaslessSwapExecuted(
         address indexed trader,
         address tokenIn,
@@ -73,51 +89,20 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
         uint256 reward
     );
 
-    /**
-     * @notice Emitted when a trader claims their accumulated rewards
-     * @param trader The address claiming rewards
-     * @param token The token being claimed
-     * @param amount The amount claimed
-     */
     event RewardsClaimed(
         address indexed trader,
         address indexed token,
         uint256 amount
     );
+    event ParameterChangeQueued(
+        string indexed paramName,
+        uint256 newValue,
+        uint256 activationTime
+    );
+    event ParameterChangeApplied(string indexed paramName, uint256 newValue);
+    event GuardianUpdated(address indexed guardian, bool status);
 
-    /**
-     * @notice EIP-712 typehash for orders
-     * @dev Includes both order parameters and pool key parameters for atomic validation
-     */
-    bytes32 public constant ORDER_TYPEHASH =
-        keccak256(
-            "Order(address trader,PoolKey poolKey,address tokenIn,address tokenOut,uint256 amount,uint256 minAmountOut,uint256 deadline,uint256 nonce,bool exactInput)PoolKey(Currency currency0,Currency currency1,uint24 fee,int24 tickSpacing,IHooks hooks)"
-        );
-
-    /**
-     * @notice EIP-712 typehash for pool keys
-     * @dev Used as part of order signing to ensure pool parameters match
-     */
-    bytes32 public constant POOLKEY_TYPEHASH =
-        keccak256(
-            "PoolKey(Currency currency0,Currency currency1,uint24 fee,int24 tickSpacing,IHooks hooks)"
-        );
-
-    /**
-     * @notice Struct containing all order parameters
-     * @dev Used for both order signing and execution
-     * @param trader Address of the trader placing the order
-     * @param poolKey Uniswap V4 pool parameters
-     * @param tokenIn Token being sold
-     * @param tokenOut Token being bought
-     * @param amount Amount of tokenIn to sell
-     * @param minAmountOut Minimum amount of tokenOut to receive
-     * @param deadline Timestamp after which the order expires
-     * @param nonce Unique order nonce for replay protection
-     * @param exactInput Whether this is an exact input swap
-     * @param orderSignature EIP-712 signature for the order
-     * @param permitSignature ERC-2612 permit signature for tokenIn
-     */
+    // --- Structs ---
     struct Order {
         address trader;
         PoolKey poolKey;
@@ -132,38 +117,7 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
         bytes permitSignature;
     }
 
-    // --- State Variables ---
-
-    /// @notice Percentage of excess value given as reward (in basis points)
-    uint256 public mevRewardBps = 200; // 2%
-
-    /// @notice Maximum allowed reward percentage
-    uint256 public constant MAX_MEV_REWARD_BPS = 1000; // 10%
-
-    /// @notice Insurance fee taken from all swaps
-    uint256 public constant INSURANCE_FEE_BPS = 5; // 0.05%
-
-    /// @notice Mapping of used nonces for replay protection
-    mapping(address => uint256) public orderNonces;
-
-    /// @notice Mapping of unclaimed rewards per token per trader
-    mapping(address => mapping(address => uint256)) public pendingRewards;
-
-    /// @notice Addresses authorized to pause the system
-    mapping(address => bool) public guardians;
-
-    /// @notice Accumulated insurance fees
-    uint256 public insuranceReserve;
-
-    /// @notice System pause state for emergency stops
-    bool public systemPaused;
-
-    /// @notice Delay required for parameter changes
-    uint256 private constant TIMELOCK_DELAY = 2 days;
-
-    /// @notice Mapping of pending parameter changes with their activation timestamps
-    mapping(bytes32 => uint256) public parameterChanges;
-
+    // --- Modifiers ---
     modifier whenNotPaused() {
         require(!systemPaused, "System paused");
         _;
@@ -178,7 +132,7 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
         Ownable(initialOwner)
     {}
 
-    // Add hook permissions
+    // --- Hook Implementation ---
     function getHookPermissions()
         public
         pure
@@ -204,11 +158,10 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
             });
     }
 
-    // Fix beforeSwap signature - remove unused params
     function beforeSwap(
         address sender,
         PoolKey calldata key,
-        IPoolManager.SwapParams calldata /* params */, // unused
+        IPoolManager.SwapParams calldata,
         bytes calldata callbackData
     ) external override returns (bytes4, BeforeSwapDelta, uint24) {
         require(!systemPaused, "System paused");
@@ -221,33 +174,87 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
         return (BaseHook.beforeSwap.selector, BeforeSwapDelta.wrap(0), 0);
     }
 
-    // Fix afterSwap signature - remove unused params
     function afterSwap(
-        address /* sender */, // unused
-        PoolKey calldata /* key */, // unused
-        IPoolManager.SwapParams calldata /* params */, // unused
+        address,
+        PoolKey calldata,
+        IPoolManager.SwapParams calldata,
         BalanceDelta delta,
         bytes calldata callbackData
     ) external override nonReentrant whenNotPaused returns (bytes4, int128) {
         Order memory order = abi.decode(callbackData, (Order));
-
-        // Handle negative values properly
-        uint256 actualAmount;
-        if (order.exactInput) {
-            int128 amount = -delta.amount0(); // Negative because tokens are leaving
-            require(amount > 0, "Invalid amount");
-            actualAmount = uint256(uint128(amount));
-        } else {
-            int128 amount = delta.amount1();
-            require(amount > 0, "Invalid amount");
-            actualAmount = uint256(uint128(amount));
-        }
+        uint256 actualAmount = calculateSwapAmount(order, delta);
 
         distributeFunds(order, actualAmount);
         return (BaseHook.afterSwap.selector, 0);
     }
 
-    // --- Order Validation --- //
+    // --- Core Logic ---
+    function calculateSwapAmount(
+        Order memory order,
+        BalanceDelta delta
+    ) internal pure returns (uint256) {
+        bool isTokenInCurrency0 = order.tokenIn ==
+            Currency.unwrap(order.poolKey.currency0);
+        int128 relevantDelta;
+        bool isOutputNegative;
+
+        if (order.exactInput) {
+            relevantDelta = isTokenInCurrency0
+                ? delta.amount1()
+                : delta.amount0();
+            isOutputNegative = true;
+        } else {
+            relevantDelta = isTokenInCurrency0
+                ? delta.amount0()
+                : delta.amount1();
+            isOutputNegative = false;
+        }
+
+        require(
+            (isOutputNegative && relevantDelta < 0) ||
+                (!isOutputNegative && relevantDelta > 0),
+            "Invalid delta direction"
+        );
+
+        return
+            isOutputNegative
+                ? uint256(uint128(-relevantDelta))
+                : uint256(uint128(relevantDelta));
+    }
+
+    function distributeFunds(
+        Order memory order,
+        uint256 actualAmount
+    ) internal {
+        require(actualAmount >= order.minAmountOut, "Slippage exceeded");
+
+        uint256 insuranceFee = (actualAmount * INSURANCE_FEE_BPS) / 10000;
+        uint256 reward = calculateMevReward(order, actualAmount - insuranceFee);
+        uint256 traderAmount = actualAmount - insuranceFee - reward;
+
+        insuranceReserve[order.tokenOut] += insuranceFee;
+        pendingRewards[order.trader][order.tokenOut] += reward;
+
+        IERC20(order.tokenOut).safeTransfer(order.trader, traderAmount);
+        emit GaslessSwapExecuted(
+            order.trader,
+            order.tokenIn,
+            order.tokenOut,
+            order.amount,
+            actualAmount,
+            reward
+        );
+    }
+
+    // Calculate MEV reward based on the current reward percentage
+    function calculateMevReward(
+        Order memory order,
+        uint256 amount
+    ) internal view returns (uint256) {
+        return (amount * mevRewardBps) / 10000;
+    }
+
+    // --- Order Validation ---
     function validateOrder(Order memory order, PoolKey calldata key) internal {
         require(order.deadline >= block.timestamp, "Order expired");
         require(order.nonce == orderNonces[order.trader]++, "Invalid nonce");
@@ -278,6 +285,82 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
         );
     }
 
+    // Process pre-swap operations like permit and token transfers
+    function processPreSwap(Order memory order) internal {
+        if (order.permitSignature.length > 0) {
+            (uint8 v, bytes32 r, bytes32 s) = splitSignature(
+                order.permitSignature
+            );
+            IERC20Permit(order.tokenIn).permit(
+                order.trader,
+                address(this),
+                order.amount,
+                order.deadline,
+                v,
+                r,
+                s
+            );
+        }
+
+        IERC20 tokenIn = IERC20(order.tokenIn);
+        tokenIn.safeTransferFrom(order.trader, address(this), order.amount);
+
+        // Reset allowance to 0 first to handle non-standard ERC20 tokens
+        if (tokenIn.allowance(address(this), address(poolManager)) > 0) {
+            tokenIn.approve(address(poolManager), 0);
+        }
+        tokenIn.approve(address(poolManager), order.amount);
+    }
+
+    // --- Admin Functions ---
+    function setMevRewardBps(uint256 newBps) external onlyOwner {
+        require(newBps <= MAX_MEV_REWARD_BPS, "Exceeds max");
+        pendingMevRewardBps = newBps;
+        pendingMevRewardBpsTime = block.timestamp + TIMELOCK_DELAY;
+        emit ParameterChangeQueued(
+            "mevRewardBps",
+            newBps,
+            pendingMevRewardBpsTime
+        );
+    }
+
+    function applyMevRewardBps() external onlyOwner {
+        require(block.timestamp >= pendingMevRewardBpsTime, "Timelocked");
+        mevRewardBps = pendingMevRewardBps;
+        emit ParameterChangeApplied("mevRewardBps", mevRewardBps);
+    }
+
+    function updateGuardian(address guardian, bool status) external onlyOwner {
+        guardians[guardian] = status;
+        emit GuardianUpdated(guardian, status);
+    }
+
+    // --- User Functions ---
+    function claimRewards(address token) external nonReentrant {
+        uint256 amount = pendingRewards[msg.sender][token];
+        require(amount > 0, "No rewards");
+
+        pendingRewards[msg.sender][token] = 0;
+        IERC20(token).safeTransfer(msg.sender, amount);
+        emit RewardsClaimed(msg.sender, token, amount);
+    }
+
+    // --- Emergency Functions ---
+    function emergencyPause(bool pause) external {
+        require(guardians[msg.sender], "Unauthorized");
+        systemPaused = pause;
+    }
+
+    function withdrawInsurance(
+        address token,
+        uint256 amount
+    ) external onlyOwner {
+        require(insuranceReserve[token] >= amount, "Insufficient reserve");
+        insuranceReserve[token] -= amount;
+        IERC20(token).safeTransfer(msg.sender, amount);
+    }
+
+    // --- Utility Functions ---
     function hashPoolKey(PoolKey memory key) internal pure returns (bytes32) {
         return
             keccak256(
@@ -292,123 +375,10 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
             );
     }
 
-    // --- Funds Handling --- //
-    function processPreSwap(Order memory order) internal {
-        // Split permit signature for ERC-2612
-        (uint8 v, bytes32 r, bytes32 s) = splitSignature(order.permitSignature);
-
-        // Process ERC-2612 permit with correct parameters
-        IERC20Permit(order.tokenIn).permit(
-            order.trader,
-            address(this),
-            order.amount,
-            order.deadline,
-            v,
-            r,
-            s
-        );
-
-        // Transfer tokens
-        IERC20(order.tokenIn).safeTransferFrom(
-            order.trader,
-            address(this),
-            order.amount
-        );
-
-        // Approve and settle
-        IERC20(order.tokenIn).approve(address(poolManager), order.amount);
-        poolManager.settle();
-    }
-
-    function distributeFunds(
-        Order memory order,
-        uint256 actualAmount
-    ) internal {
-        require(actualAmount >= order.minAmountOut, "Slippage exceeded");
-
-        uint256 insuranceFee = (actualAmount * INSURANCE_FEE_BPS) / 10000;
-        uint256 reward = calculateMevReward(order, actualAmount - insuranceFee);
-        uint256 traderAmount = actualAmount - insuranceFee - reward;
-
-        insuranceReserve += insuranceFee;
-        pendingRewards[order.trader][order.tokenOut] += reward;
-
-        IERC20(order.tokenOut).safeTransfer(order.trader, traderAmount);
-        emit GaslessSwapExecuted(
-            order.trader,
-            order.tokenIn,
-            order.tokenOut,
-            order.amount,
-            actualAmount,
-            reward
-        );
-    }
-
-    function calculateMevReward(
-        Order memory order,
-        uint256 amount
-    ) internal view returns (uint256) {
-        uint256 minOut = order.minAmountOut;
-        if (amount <= minOut) return 0;
-        return ((amount - minOut) * mevRewardBps) / 10000;
-    }
-
-    // --- User Functions --- //
-    function claimRewards(address token) external nonReentrant {
-        uint256 amount = pendingRewards[msg.sender][token];
-        require(amount > 0, "No rewards");
-
-        pendingRewards[msg.sender][token] = 0;
-        IERC20(token).safeTransfer(msg.sender, amount);
-        emit RewardsClaimed(msg.sender, token, amount);
-    }
-
-    // --- Admin Functions --- //
-    function setMevRewardBps(uint256 newBps) external onlyOwner {
-        require(newBps <= MAX_MEV_REWARD_BPS, "Exceeds max");
-        require(
-            block.timestamp >= parameterChanges[keccak256("mevRewardBps")],
-            "Timelocked"
-        );
-
-        mevRewardBps = newBps;
-        parameterChanges[keccak256("mevRewardBps")] =
-            block.timestamp +
-            TIMELOCK_DELAY;
-    }
-
-    function addGuardian(address guardian) external onlyOwner {
-        guardians[guardian] = true;
-    }
-
-    function emergencyPause(bool pause) external {
-        require(guardians[msg.sender], "Unauthorized");
-        systemPaused = pause;
-    }
-
-    function withdrawInsurance(
-        address token,
-        uint256 amount
-    ) external onlyOwner {
-        insuranceReserve -= amount;
-        IERC20(token).safeTransfer(msg.sender, amount);
-    }
-
-    // Fix validateTwap - change to pure and remove unused params
-    function validateTwap(
-        PoolKey memory /* key */, // unused
-        uint32 /* twapWindow */, // unused
-        uint256 /* maxDeviationBps */ // unused
-    ) internal pure {
-        revert("TWAP validation not implemented in v4");
-    }
-
-    // Add helper function for signature splitting
     function splitSignature(
         bytes memory sig
     ) internal pure returns (uint8 v, bytes32 r, bytes32 s) {
         require(sig.length == 65, "Invalid signature length");
-
         assembly {
             r := mload(add(sig, 32))
             s := mload(add(sig, 64))
@@ -416,6 +386,6 @@ contract GaslessSwapHook is BaseHook, EIP712, ReentrancyGuard, Ownable {
         }
     }
 
-    // --- Fallbacks --- //
-    receive() external payable {} // For native token handling
+    // --- Fallback ---
+    receive() external payable {} // Explicitly handle native ETH
 }
