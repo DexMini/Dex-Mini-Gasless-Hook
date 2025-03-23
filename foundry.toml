@@ -4,6 +4,10 @@ out = "out"
 libs = ["lib"]
 test = "test"
 script = "script"
+via_ir = true
+optimizer = true
+optimizer_runs = 1000
+verbosity = 3
 
 # Remappings for dependencies
 remappings = [
